@@ -10,10 +10,11 @@ use embassy_rp::bind_interrupts;
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::peripherals::{DMA_CH0, PIO0};
 use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
-use embassy_rp::spi::{Config as SpiConfig, Spi};
+use embassy_rp::spi::{Blocking, Config as SpiConfig, Spi};
 use embassy_time::{Duration, Timer};
 use embedded_hal_bus::spi::ExclusiveDevice;
 use embedded_io_async::Write;
+use embedded_sdmmc::{SdCard, TimeSource, Timestamp, VolumeManager};
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
@@ -36,6 +37,32 @@ bind_interrupts!(struct Irqs {
 const WIFI_SSID: &str = "PicoW_SD_Browser";
 const WIFI_PASSWORD: &str = "12345678";
 
+// Dummy TimeSource for SD card
+struct DummyTimesource;
+impl TimeSource for DummyTimesource {
+    fn get_timestamp(&self) -> Timestamp {
+        Timestamp::from_fat(0, 0)
+    }
+}
+
+// Shared SD card file list
+static SD_FILES: embassy_sync::mutex::Mutex<
+    embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
+    heapless::Vec<FileInfo, 32>,
+> = embassy_sync::mutex::Mutex::new(heapless::Vec::new());
+
+static SD_STATUS: embassy_sync::mutex::Mutex<
+    embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
+    &str,
+> = embassy_sync::mutex::Mutex::new("Initializing...");
+
+#[derive(Clone, Copy)]
+struct FileInfo {
+    name: heapless::String<64>,
+    size: u32,
+    is_dir: bool,
+}
+
 #[embassy_executor::task]
 async fn cyw43_task(
     runner: cyw43::Runner<'static, Output<'static>, PioSpi<'static, PIO0, 0, DMA_CH0>>,
@@ -46,6 +73,148 @@ async fn cyw43_task(
 #[embassy_executor::task]
 async fn net_task(mut runner: embassy_net::Runner<'static, cyw43::NetDriver<'static>>) -> ! {
     runner.run().await
+}
+
+#[embassy_executor::task]
+async fn sd_card_task(
+    mut spi: Spi<'static, embassy_rp::peripherals::SPI0, Blocking>,
+    cs: Output<'static>,
+) {
+    info!("SD card task started, waiting for system to stabilize...");
+    Timer::after(Duration::from_secs(3)).await;
+
+    loop {
+        info!("Attempting to read SD card...");
+
+        // Use ExclusiveDevice for CS management
+        let spi_device = ExclusiveDevice::new(spi, cs, embassy_time::Delay);
+
+        match read_sd_card(spi_device) {
+            Ok((new_spi, new_cs, file_list)) => {
+                // Update shared state
+                {
+                    let mut files = SD_FILES.lock().await;
+                    files.clear();
+                    for file in file_list {
+                        let _ = files.push(file);
+                    }
+                }
+
+                {
+                    let mut status = SD_STATUS.lock().await;
+                    *status = "Ready";
+                }
+
+                info!("SD card read successfully, found {} files", file_list.len());
+                spi = new_spi;
+                cs = new_cs;
+            }
+            Err((new_spi, new_cs, e)) => {
+                {
+                    let mut status = SD_STATUS.lock().await;
+                    *status = e;
+                }
+                warn!("SD card error: {}", e);
+                spi = new_spi;
+                cs = new_cs;
+            }
+        }
+
+        // Scan every 15 seconds
+        Timer::after(Duration::from_secs(15)).await;
+    }
+}
+
+fn read_sd_card(
+    spi_device: ExclusiveDevice<Spi<'static, embassy_rp::peripherals::SPI0, Blocking>, Output<'static>, embassy_time::Delay>,
+) -> Result<
+    (Spi<'static, embassy_rp::peripherals::SPI0, Blocking>, Output<'static>, heapless::Vec<FileInfo, 32>),
+    (Spi<'static, embassy_rp::peripherals::SPI0, Blocking>, Output<'static>, &'static str),
+> {
+    let mut file_list: heapless::Vec<FileInfo, 32> = heapless::Vec::new();
+
+    // Create SD card instance
+    let mut sd_card = SdCard::new(spi_device, embassy_time::Delay);
+
+    // Initialize SD card
+    match sd_card.num_bytes() {
+        Ok(size) => {
+            info!("SD card detected: {} bytes", size);
+        }
+        Err(_) => {
+            let (spi, cs) = sd_card.destroy();
+            let (spi_inner, cs_inner, _delay) = spi.release();
+            return Err((spi_inner, cs_inner, "No SD card detected"));
+        }
+    }
+
+    // Create volume manager
+    let mut volume_mgr = VolumeManager::new(sd_card, DummyTimesource);
+
+    // Open volume
+    let volume = match volume_mgr.open_volume(embedded_sdmmc::VolumeIdx(0)) {
+        Ok(v) => v,
+        Err(_) => {
+            let sd = volume_mgr.free();
+            let (spi, cs) = sd.destroy();
+            let (spi_inner, cs_inner, _delay) = spi.release();
+            return Err((spi_inner, cs_inner, "Failed to open volume (format as FAT32)"));
+        }
+    };
+
+    // Open root directory
+    let root_dir = match volume_mgr.open_root_dir(&volume) {
+        Ok(dir) => dir,
+        Err(_) => {
+            volume_mgr.close_volume(volume).ok();
+            let sd = volume_mgr.free();
+            let (spi, cs) = sd.destroy();
+            let (spi_inner, cs_inner, _delay) = spi.release();
+            return Err((spi_inner, cs_inner, "Failed to open root directory"));
+        }
+    };
+
+    // Iterate through directory
+    let _ = volume_mgr.iterate_dir(&volume, &root_dir, |entry| {
+        let mut name = heapless::String::new();
+
+        // Convert filename to string
+        use core::fmt::Write;
+        let _ = write!(&mut name, "{}", entry.name);
+
+        let file_info = FileInfo {
+            name,
+            size: entry.size,
+            is_dir: entry.attributes.is_directory(),
+        };
+
+        let _ = file_list.push(file_info);
+    });
+
+    // Clean up
+    volume_mgr.close_dir(&volume, root_dir).ok();
+    volume_mgr.close_volume(volume).ok();
+
+    let sd = volume_mgr.free();
+    let (spi, cs) = sd.destroy();
+    let (spi_inner, cs_inner, _delay) = spi.release();
+
+    Ok((spi_inner, cs_inner, file_list))
+}
+
+fn format_size(bytes: u32) -> heapless::String<16> {
+    let mut result = heapless::String::new();
+    use core::fmt::Write;
+
+    if bytes < 1024 {
+        let _ = write!(&mut result, "{} B", bytes);
+    } else if bytes < 1024 * 1024 {
+        let _ = write!(&mut result, "{} KB", bytes / 1024);
+    } else {
+        let _ = write!(&mut result, "{} MB", bytes / (1024 * 1024));
+    }
+
+    result
 }
 
 #[embassy_executor::task]
@@ -117,6 +286,13 @@ async fn handle_client(socket: &mut TcpSocket<'_>) -> Result<(), embassy_net::tc
             let path = parts[1];
             info!("Method: {}, Path: {}", method, path);
 
+            // Get SD card status and file list
+            let sd_status = SD_STATUS.lock().await;
+            let files = SD_FILES.lock().await;
+            let file_count = files.len();
+            let status_str = *sd_status;
+            drop(sd_status);
+
             // Send HTTP response
             let _ = socket.write_all(b"HTTP/1.1 200 OK\r\n").await;
             let _ = socket.write_all(b"Content-Type: text/html; charset=utf-8\r\n").await;
@@ -150,19 +326,56 @@ async fn handle_client(socket: &mut TcpSocket<'_>) -> Result<(), embassy_net::tc
             let _ = socket.write_all(b"</div>\n").await;
 
             let _ = socket.write_all(b"<h2>Files on SD Card:</h2>\n").await;
-            let _ = socket.write_all(b"<ul>\n").await;
-            let _ = socket.write_all(b"<li>\xF0\x9F\x93\x84 README.txt <span style='color:#999'>(1.2 KB)</span></li>\n").await;
-            let _ = socket.write_all(b"<li>\xF0\x9F\x93\x84 config.json <span style='color:#999'>(456 bytes)</span></li>\n").await;
-            let _ = socket.write_all(b"<li>\xF0\x9F\x93\x81 data/ <span style='color:#999'>(directory)</span></li>\n").await;
-            let _ = socket.write_all(b"<li>\xF0\x9F\x93\x84 log.txt <span style='color:#999'>(3.4 KB)</span></li>\n").await;
-            let _ = socket.write_all(b"<li>\xF0\x9F\x93\x84 sensor_data.csv <span style='color:#999'>(8.9 KB)</span></li>\n").await;
-            let _ = socket.write_all(b"<li>\xF0\x9F\x93\x84 photos.zip <span style='color:#999'>(245 KB)</span></li>\n").await;
-            let _ = socket.write_all(b"</ul>\n").await;
 
-            let _ = socket.write_all(b"<div class='hw-info'>\n").await;
-            let _ = socket.write_all(b"<strong>\xE2\x9A\xA0\xEF\xB8\x8F Note:</strong> SD card reading implementation in progress.\n").await;
-            let _ = socket.write_all(b"The files shown above are sample data.\n").await;
-            let _ = socket.write_all(b"</div>\n").await;
+            if file_count == 0 {
+                let _ = socket.write_all(b"<div class='hw-info'>\n").await;
+                let _ = socket.write_all(b"<strong>\xE2\x9A\xA0\xEF\xB8\x8F Status:</strong> ").await;
+                let _ = socket.write_all(status_str.as_bytes()).await;
+                let _ = socket.write_all(b"</div>\n").await;
+                let _ = socket.write_all(b"<p style='color:#999'>No files found. Make sure SD card is:</p>\n").await;
+                let _ = socket.write_all(b"<ul style='color:#999'>\n").await;
+                let _ = socket.write_all(b"<li>Properly inserted</li>\n").await;
+                let _ = socket.write_all(b"<li>Formatted as FAT32</li>\n").await;
+                let _ = socket.write_all(b"<li>Connected to correct SPI pins</li>\n").await;
+                let _ = socket.write_all(b"</ul>\n").await;
+            } else {
+                let _ = socket.write_all(b"<div style='background:#e8f5e9;padding:10px;border-radius:5px;margin-bottom:15px'>\n").await;
+                let _ = socket.write_all(b"<strong>\xE2\x9C\x85 SD Card Status:</strong> ").await;
+                let _ = socket.write_all(status_str.as_bytes()).await;
+                let _ = socket.write_all(b" | <strong>Files found:</strong> ").await;
+
+                let mut count_str = heapless::String::<8>::new();
+                use core::fmt::Write as _;
+                let _ = write!(&mut count_str, "{}", file_count);
+                let _ = socket.write_all(count_str.as_bytes()).await;
+                let _ = socket.write_all(b"</div>\n").await;
+
+                let _ = socket.write_all(b"<ul>\n").await;
+
+                for file in files.iter() {
+                    let _ = socket.write_all(b"<li>").await;
+
+                    if file.is_dir {
+                        let _ = socket.write_all(b"\xF0\x9F\x93\x81 ").await; // 📁
+                    } else {
+                        let _ = socket.write_all(b"\xF0\x9F\x93\x84 ").await; // 📄
+                    }
+
+                    let _ = socket.write_all(file.name.as_bytes()).await;
+                    let _ = socket.write_all(b" <span style='color:#999'>(").await;
+
+                    if file.is_dir {
+                        let _ = socket.write_all(b"directory").await;
+                    } else {
+                        let size_str = format_size(file.size);
+                        let _ = socket.write_all(size_str.as_bytes()).await;
+                    }
+
+                    let _ = socket.write_all(b")</span></li>\n").await;
+                }
+
+                let _ = socket.write_all(b"</ul>\n").await;
+            }
 
             let _ = socket.write_all(b"<div class='info'>\n").await;
             let _ = socket.write_all(b"<p><strong>Current Status:</strong></p>\n").await;
@@ -170,7 +383,14 @@ async fn handle_client(socket: &mut TcpSocket<'_>) -> Result<(), embassy_net::tc
             let _ = socket.write_all(b"<li>\xE2\x9C\x85 WiFi Access Point: Active</li>\n").await;
             let _ = socket.write_all(b"<li>\xE2\x9C\x85 HTTP Server: Running</li>\n").await;
             let _ = socket.write_all(b"<li>\xE2\x9C\x85 SPI Interface: Initialized</li>\n").await;
-            let _ = socket.write_all(b"<li>\xE2\x8F\xB3 SD Card Reader: Coming soon</li>\n").await;
+
+            if file_count > 0 {
+                let _ = socket.write_all(b"<li>\xE2\x9C\x85 SD Card Reader: Active</li>\n").await;
+            } else {
+                let _ = socket.write_all(b"<li>\xE2\x9A\xA0\xEF\xB8\x8F SD Card Reader: ").await;
+                let _ = socket.write_all(status_str.as_bytes()).await;
+                let _ = socket.write_all(b"</li>\n").await;
+            }
             let _ = socket.write_all(b"</ul>\n").await;
 
             let _ = socket.write_all(b"<p><strong>Hardware Configuration:</strong></p>\n").await;
@@ -239,24 +459,21 @@ async fn main(spawner: Spawner) {
 
     info!("CYW43 initialized successfully");
 
-    // Initialize SD Card SPI (for future implementation)
+    // Initialize SD Card SPI (blocking mode for embedded-sdmmc)
     info!("Initializing SD card SPI interface...");
-    let mut sd_config = SpiConfig::default();
-    sd_config.frequency = 400_000; // Start slow for SD card init
+    let mut sd_spi_config = SpiConfig::default();
+    sd_spi_config.frequency = 400_000; // Start at 400kHz for SD card initialization
 
-    let spi_bus = Spi::new(
+    let sd_spi = Spi::new_blocking(
         p.SPI0,
         p.PIN_2,  // CLK
         p.PIN_3,  // MOSI
         p.PIN_0,  // MISO
-        p.DMA_CH1,
-        p.DMA_CH2,
-        sd_config,
+        sd_spi_config,
     );
 
-    let spi_cs = Output::new(p.PIN_5, Level::High);
-    let _spi_device = ExclusiveDevice::new(spi_bus, spi_cs, embassy_time::Delay);
-    info!("SD card SPI interface initialized (reading implementation pending)");
+    let sd_cs = Output::new(p.PIN_5, Level::High);
+    info!("SD card SPI initialized in blocking mode");
 
     // Configure network stack for AP mode with static IP
     info!("Configuring network stack...");
@@ -292,6 +509,11 @@ async fn main(spawner: Spawner) {
     // Wait for network stack to be ready
     Timer::after(Duration::from_secs(2)).await;
     info!("Network stack ready");
+
+    // Spawn SD card scanning task
+    info!("Starting SD card scanner task...");
+    spawner.spawn(sd_card_task(sd_spi, sd_cs).unwrap());
+    info!("SD card scanner task spawned");
 
     // Spawn HTTP server
     info!("Starting HTTP server task...");

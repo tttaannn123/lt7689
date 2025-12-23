@@ -56,7 +56,7 @@ static SD_STATUS: embassy_sync::mutex::Mutex<
     &str,
 > = embassy_sync::mutex::Mutex::new("Initializing...");
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct FileInfo {
     name: heapless::String<64>,
     size: u32,
@@ -87,7 +87,7 @@ async fn sd_card_task(
         info!("Attempting to read SD card...");
 
         // Use ExclusiveDevice for CS management
-        let spi_device = ExclusiveDevice::new(spi, cs, embassy_time::Delay);
+        let spi_device = ExclusiveDevice::new_no_delay(spi, cs).unwrap();
 
         match read_sd_card(spi_device) {
             Ok((new_spi, new_cs, file_list)) => {
@@ -126,7 +126,7 @@ async fn sd_card_task(
 }
 
 fn read_sd_card(
-    spi_device: ExclusiveDevice<Spi<'static, embassy_rp::peripherals::SPI0, Blocking>, Output<'static>, embassy_time::Delay>,
+    spi_device: ExclusiveDevice<Spi<'static, embassy_rp::peripherals::SPI0, Blocking>, Output<'static>>,
 ) -> Result<
     (Spi<'static, embassy_rp::peripherals::SPI0, Blocking>, Output<'static>, heapless::Vec<FileInfo, 32>),
     (Spi<'static, embassy_rp::peripherals::SPI0, Blocking>, Output<'static>, &'static str),
@@ -142,8 +142,8 @@ fn read_sd_card(
             info!("SD card detected: {} bytes", size);
         }
         Err(_) => {
-            let (spi, cs) = sd_card.destroy();
-            let (spi_inner, cs_inner, _delay) = spi.release();
+            let (spi, cs) = sd_card.free();
+            let (spi_inner, cs_inner) = spi.release();
             return Err((spi_inner, cs_inner, "No SD card detected"));
         }
     }
@@ -152,35 +152,34 @@ fn read_sd_card(
     let mut volume_mgr = VolumeManager::new(sd_card, DummyTimesource);
 
     // Open volume
-    let volume = match volume_mgr.open_volume(embedded_sdmmc::VolumeIdx(0)) {
+    let mut volume = match volume_mgr.open_volume(embedded_sdmmc::VolumeIdx(0)) {
         Ok(v) => v,
         Err(_) => {
             let sd = volume_mgr.free();
-            let (spi, cs) = sd.destroy();
-            let (spi_inner, cs_inner, _delay) = spi.release();
+            let (spi, cs) = sd.free();
+            let (spi_inner, cs_inner) = spi.release();
             return Err((spi_inner, cs_inner, "Failed to open volume (format as FAT32)"));
         }
     };
 
     // Open root directory
-    let root_dir = match volume_mgr.open_root_dir(&volume) {
+    let root_dir = match volume.open_root_dir() {
         Ok(dir) => dir,
         Err(_) => {
             volume_mgr.close_volume(volume).ok();
             let sd = volume_mgr.free();
-            let (spi, cs) = sd.destroy();
-            let (spi_inner, cs_inner, _delay) = spi.release();
+            let (spi, cs) = sd.free();
+            let (spi_inner, cs_inner) = spi.release();
             return Err((spi_inner, cs_inner, "Failed to open root directory"));
         }
     };
 
     // Iterate through directory
-    let _ = volume_mgr.iterate_dir(&volume, &root_dir, |entry| {
+    let _ = volume.iterate_dir(root_dir, |entry| {
         let mut name = heapless::String::new();
 
-        // Convert filename to string
-        use core::fmt::Write;
-        let _ = write!(&mut name, "{}", entry.name);
+        // Convert filename to string - use core::fmt::Write explicitly
+        let _ = core::fmt::Write::write_fmt(&mut name, format_args!("{}", entry.name));
 
         let file_info = FileInfo {
             name,
@@ -192,26 +191,25 @@ fn read_sd_card(
     });
 
     // Clean up
-    volume_mgr.close_dir(&volume, root_dir).ok();
+    volume.close_dir(root_dir).ok();
     volume_mgr.close_volume(volume).ok();
 
     let sd = volume_mgr.free();
-    let (spi, cs) = sd.destroy();
-    let (spi_inner, cs_inner, _delay) = spi.release();
+    let (spi, cs) = sd.free();
+    let (spi_inner, cs_inner) = spi.release();
 
     Ok((spi_inner, cs_inner, file_list))
 }
 
 fn format_size(bytes: u32) -> heapless::String<16> {
     let mut result = heapless::String::new();
-    use core::fmt::Write;
 
     if bytes < 1024 {
-        let _ = write!(&mut result, "{} B", bytes);
+        let _ = core::fmt::Write::write_fmt(&mut result, format_args!("{} B", bytes));
     } else if bytes < 1024 * 1024 {
-        let _ = write!(&mut result, "{} KB", bytes / 1024);
+        let _ = core::fmt::Write::write_fmt(&mut result, format_args!("{} KB", bytes / 1024));
     } else {
-        let _ = write!(&mut result, "{} MB", bytes / (1024 * 1024));
+        let _ = core::fmt::Write::write_fmt(&mut result, format_args!("{} MB", bytes / (1024 * 1024)));
     }
 
     result
@@ -345,29 +343,28 @@ async fn handle_client(socket: &mut TcpSocket<'_>) -> Result<(), embassy_net::tc
                 let _ = socket.write_all(b" | <strong>Files found:</strong> ").await;
 
                 let mut count_str = heapless::String::<8>::new();
-                use core::fmt::Write as _;
-                let _ = write!(&mut count_str, "{}", file_count);
+                let _ = core::fmt::Write::write_fmt(&mut count_str, format_args!("{}", file_count));
                 let _ = socket.write_all(count_str.as_bytes()).await;
                 let _ = socket.write_all(b"</div>\n").await;
 
                 let _ = socket.write_all(b"<ul>\n").await;
 
-                for file in files.iter() {
+                for file_info in files.iter() {
                     let _ = socket.write_all(b"<li>").await;
 
-                    if file.is_dir {
+                    if file_info.is_dir {
                         let _ = socket.write_all(b"\xF0\x9F\x93\x81 ").await; // 📁
                     } else {
                         let _ = socket.write_all(b"\xF0\x9F\x93\x84 ").await; // 📄
                     }
 
-                    let _ = socket.write_all(file.name.as_bytes()).await;
+                    let _ = socket.write_all(file_info.name.as_bytes()).await;
                     let _ = socket.write_all(b" <span style='color:#999'>(").await;
 
-                    if file.is_dir {
+                    if file_info.is_dir {
                         let _ = socket.write_all(b"directory").await;
                     } else {
-                        let size_str = format_size(file.size);
+                        let size_str = format_size(file_info.size);
                         let _ = socket.write_all(size_str.as_bytes()).await;
                     }
 

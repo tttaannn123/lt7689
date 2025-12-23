@@ -69,7 +69,7 @@ jobs:
       - name: Prepare ELF
         run: |
           mkdir -p out
-          cp target/thumbv8m.main-none-eabihf/release/pico2w-wifi-gateway out/firmware.elf
+          cp target/thumbv8m.main-none-eabihf/release/lt7689 out/firmware.elf
 
       - name: Convert ELF to UF2
         run: |

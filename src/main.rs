@@ -10,7 +10,7 @@ use embassy_rp::bind_interrupts;
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::peripherals::{DMA_CH0, PIO0};
 use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
-use embassy_rp::spi::{Blocking, Config as SpiConfig, Spi};
+use embassy_rp::spi::{Config as SpiConfig, Spi};
 use embassy_time::{Duration, Timer};
 use embedded_hal_bus::spi::ExclusiveDevice;
 use embedded_io_async::Write;
@@ -89,7 +89,7 @@ async fn sd_card_task() {
                 {
                     let mut files = SD_FILES.lock().await;
                     files.clear();
-                    for file in file_list {
+                    for file in &file_list {
                         let _ = files.push(file);
                     }
                 }
@@ -136,7 +136,10 @@ fn read_sd_card() -> Result<heapless::Vec<FileInfo, 32>, &'static str> {
     );
 
     // Create SD card instance
-    let spi_device = ExclusiveDevice::new(spi, cs, embassy_time::Delay);
+    let spi_device = match ExclusiveDevice::new(spi, cs, embassy_time::Delay) {
+        Ok(dev) => dev,
+        Err(_) => return Err("Failed to create SPI device"),
+    };
     let mut sd_card = SdCard::new(spi_device, embassy_time::Delay);
 
     // Initialize SD card

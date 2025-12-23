@@ -90,7 +90,7 @@ async fn sd_card_task() {
                     let mut files = SD_FILES.lock().await;
                     files.clear();
                     for file in &file_list {
-                        let _ = files.push(file);
+                        let _ = files.push(file.clone());
                     }
                 }
 
@@ -172,7 +172,7 @@ fn read_sd_card() -> Result<heapless::Vec<FileInfo, 32>, &'static str> {
     };
 
     // Iterate through directory
-    let _ = volume.iterate_dir(root_dir, |entry| {
+    let _ = root_dir.iterate_dir(|entry| {
         let mut name = heapless::String::new();
 
         // Convert filename to string - use core::fmt::Write explicitly
@@ -188,7 +188,7 @@ fn read_sd_card() -> Result<heapless::Vec<FileInfo, 32>, &'static str> {
     });
 
     // Clean up
-    volume.close_dir(root_dir).ok();
+    root_dir.close().ok();
 
     Ok(file_list)
 }

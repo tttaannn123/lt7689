@@ -391,7 +391,7 @@ async fn handle_client(socket: &mut TcpSocket<'_>) -> Result<(), embassy_net::tc
 
             let _ = socket.write_all(b"<p style='color:#666;font-size:0.85em;margin-top:20px'>\n").await;
             let _ = socket.write_all(b"<strong>Instructions:</strong><br>\n").await;
-            let _ = socket.write_all(b"1. Connect SD card module: CS→GP17, SCK→GP18, MOSI→GP19, MISO→GP16, VCC→3.3V, GND→GND<br>\n").await;
+            let _ = socket.write_all(b"1. Connect SD card module: CS->GP17, SCK->GP18, MOSI->GP19, MISO->GP16, VCC->3.3V, GND->GND<br>\n").await;
             let _ = socket.write_all(b"2. Format SD card as FAT32<br>\n").await;
             let _ = socket.write_all(b"3. Add files to SD card<br>\n").await;
             let _ = socket.write_all(b"4. Files will be listed here when SD reading is implemented<br>\n").await;

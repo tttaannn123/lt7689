@@ -1,0 +1,9 @@
+[dependencies]
+embassy-rp = { version = "0.3", features = ["defmt", "unstable-pac", "time-driver-timer", "critical-section-impl", "rp235x"] }
+embassy-executor = { version = "0.7", features = ["arch-arm", "task-arena-size-16384"] }
+embassy-net = { version = "0.6", features = ["tcp", "dhcpv4", "medium-ethernet", "proto-ipv4"] }
+cyw43 = { version = "0.3", features = ["defmt", "firmware-logs"] }
+cyw43-pio = "0.3"
+embedded-sdmmc = "0.8"
+embedded-hal-bus = "0.3"
+static_cell = "2.1"

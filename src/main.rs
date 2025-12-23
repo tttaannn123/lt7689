@@ -140,7 +140,7 @@ fn read_sd_card() -> Result<heapless::Vec<FileInfo, 32>, &'static str> {
         Ok(dev) => dev,
         Err(_) => return Err("Failed to create SPI device"),
     };
-    let mut sd_card = SdCard::new(spi_device, embassy_time::Delay);
+    let sd_card = SdCard::new(spi_device, embassy_time::Delay);
 
     // Initialize SD card
     match sd_card.num_bytes() {
@@ -164,7 +164,7 @@ fn read_sd_card() -> Result<heapless::Vec<FileInfo, 32>, &'static str> {
     };
 
     // Open root directory
-    let root_dir = match volume.open_root_dir() {
+    let mut root_dir = match volume.open_root_dir() {
         Ok(dir) => dir,
         Err(_) => {
             return Err("Failed to open root directory");

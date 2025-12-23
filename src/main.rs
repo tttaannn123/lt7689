@@ -87,7 +87,7 @@ async fn sd_card_task(
         info!("Attempting to read SD card...");
 
         // Use ExclusiveDevice for CS management
-        let spi_device = ExclusiveDevice::new_no_delay(spi, cs).unwrap();
+        let spi_device = ExclusiveDevice::new(spi, cs, embassy_time::Delay);
 
         match read_sd_card(spi_device) {
             Ok((new_spi, new_cs, file_list)) => {
@@ -126,7 +126,7 @@ async fn sd_card_task(
 }
 
 fn read_sd_card(
-    spi_device: ExclusiveDevice<Spi<'static, embassy_rp::peripherals::SPI0, Blocking>, Output<'static>>,
+    spi_device: ExclusiveDevice<Spi<'static, embassy_rp::peripherals::SPI0, Blocking>, Output<'static>, embassy_time::Delay>,
 ) -> Result<
     (Spi<'static, embassy_rp::peripherals::SPI0, Blocking>, Output<'static>, heapless::Vec<FileInfo, 32>),
     (Spi<'static, embassy_rp::peripherals::SPI0, Blocking>, Output<'static>, &'static str),
@@ -143,39 +143,39 @@ fn read_sd_card(
         }
         Err(_) => {
             let (spi, cs) = sd_card.free();
-            let (spi_inner, cs_inner) = spi.release();
+            let (spi_inner, cs_inner, _delay) = spi.release();
             return Err((spi_inner, cs_inner, "No SD card detected"));
         }
     }
 
     // Create volume manager
-    let mut volume_mgr = VolumeManager::new(sd_card, DummyTimesource);
+    let mut volume_mgr: VolumeManager<_, _, 4, 4, 1> = VolumeManager::new(sd_card, DummyTimesource);
 
     // Open volume
-    let mut volume = match volume_mgr.open_volume(embedded_sdmmc::VolumeIdx(0)) {
+    let volume = match volume_mgr.open_volume(embedded_sdmmc::VolumeIdx(0)) {
         Ok(v) => v,
         Err(_) => {
             let sd = volume_mgr.free();
             let (spi, cs) = sd.free();
-            let (spi_inner, cs_inner) = spi.release();
+            let (spi_inner, cs_inner, _delay) = spi.release();
             return Err((spi_inner, cs_inner, "Failed to open volume (format as FAT32)"));
         }
     };
 
     // Open root directory
-    let root_dir = match volume.open_root_dir() {
+    let root_dir = match volume_mgr.open_root_dir(volume) {
         Ok(dir) => dir,
         Err(_) => {
             volume_mgr.close_volume(volume).ok();
             let sd = volume_mgr.free();
             let (spi, cs) = sd.free();
-            let (spi_inner, cs_inner) = spi.release();
+            let (spi_inner, cs_inner, _delay) = spi.release();
             return Err((spi_inner, cs_inner, "Failed to open root directory"));
         }
     };
 
     // Iterate through directory
-    let _ = volume.iterate_dir(root_dir, |entry| {
+    let _ = volume_mgr.iterate_dir(root_dir, |entry| {
         let mut name = heapless::String::new();
 
         // Convert filename to string - use core::fmt::Write explicitly
@@ -191,12 +191,12 @@ fn read_sd_card(
     });
 
     // Clean up
-    volume.close_dir(root_dir).ok();
+    volume_mgr.close_dir(root_dir).ok();
     volume_mgr.close_volume(volume).ok();
 
     let sd = volume_mgr.free();
     let (spi, cs) = sd.free();
-    let (spi_inner, cs_inner) = spi.release();
+    let (spi_inner, cs_inner, _delay) = spi.release();
 
     Ok((spi_inner, cs_inner, file_list))
 }

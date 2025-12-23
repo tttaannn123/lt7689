@@ -19,10 +19,10 @@ A WiFi-enabled SD card file browser running on the Raspberry Pi Pico 2W, built w
 ## Wiring
 
 ### SD Card Module (SPI0)
-- **CLK** → GPIO 2
-- **MOSI** → GPIO 3
-- **MISO** → GPIO 0
-- **CS** → GPIO 5
+- **SCK/CLK** → GPIO 18
+- **MOSI** → GPIO 19
+- **MISO** → GPIO 16
+- **CS** → GPIO 17
 - **VCC** → 3.3V
 - **GND** → GND
 
@@ -134,12 +134,23 @@ If you encounter build errors:
 3. Try forgetting and reconnecting to the network
 4. Check serial output with `probe-rs` for error messages
 
+**Note:** Some devices may show the network but fail to connect on first try. Wait a few seconds and try again.
+
 ### SD Card Not Detected
 
-1. Verify wiring connections match the pinout above
-2. Ensure SD card is formatted as FAT32
-3. Try a different SD card (some cards may not be compatible)
-4. Check SPI bus with logic analyzer if available
+**Important:** Make sure you're connecting to the correct pins!
+- **SCK** (on SD module) connects to **GPIO 18**
+- **MOSI** connects to **GPIO 19**
+- **MISO** connects to **GPIO 16**
+- **CS** connects to **GPIO 17**
+
+If still not working:
+1. Verify wiring connections - double-check each wire
+2. Ensure SD card is formatted as **FAT32** (not exFAT or NTFS)
+3. Try a smaller SD card (≤32GB works best)
+4. Check that SD card is fully inserted in the module
+5. Verify 3.3V power is connected (not 5V!)
+6. Try a different SD card (some older cards may not be compatible)
 
 ## License
 

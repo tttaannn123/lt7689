@@ -124,14 +124,14 @@ fn read_sd_card() -> Result<heapless::Vec<FileInfo, 32>, &'static str> {
 
     let spi = Spi::new_blocking(
         unsafe { embassy_rp::peripherals::SPI0::steal() },
-        unsafe { embassy_rp::peripherals::PIN_2::steal() },
-        unsafe { embassy_rp::peripherals::PIN_3::steal() },
-        unsafe { embassy_rp::peripherals::PIN_0::steal() },
+        unsafe { embassy_rp::peripherals::PIN_18::steal() },
+        unsafe { embassy_rp::peripherals::PIN_19::steal() },
+        unsafe { embassy_rp::peripherals::PIN_16::steal() },
         sd_spi_config,
     );
 
     let cs = Output::new(
-        unsafe { embassy_rp::peripherals::PIN_5::steal() },
+        unsafe { embassy_rp::peripherals::PIN_17::steal() },
         Level::High,
     );
 
@@ -386,12 +386,12 @@ async fn handle_client(socket: &mut TcpSocket<'_>) -> Result<(), embassy_net::tc
             let _ = socket.write_all(b"<ul>\n").await;
             let _ = socket.write_all(b"<li><strong>MCU:</strong> RP2350A (Dual Cortex-M33 @ 150MHz)</li>\n").await;
             let _ = socket.write_all(b"<li><strong>WiFi:</strong> CYW43439 (2.4GHz 802.11n)</li>\n").await;
-            let _ = socket.write_all(b"<li><strong>SD Card SPI:</strong> CLK=GP2, MOSI=GP3, MISO=GP0, CS=GP5</li>\n").await;
+            let _ = socket.write_all(b"<li><strong>SD Card SPI:</strong> SCK=GP18, MOSI=GP19, MISO=GP16, CS=GP17</li>\n").await;
             let _ = socket.write_all(b"</ul>\n").await;
 
             let _ = socket.write_all(b"<p style='color:#666;font-size:0.85em;margin-top:20px'>\n").await;
             let _ = socket.write_all(b"<strong>Instructions:</strong><br>\n").await;
-            let _ = socket.write_all(b"1. Connect SD card module to Pico 2W using pins listed above<br>\n").await;
+            let _ = socket.write_all(b"1. Connect SD card module: CS→GP17, SCK→GP18, MOSI→GP19, MISO→GP16, VCC→3.3V, GND→GND<br>\n").await;
             let _ = socket.write_all(b"2. Format SD card as FAT32<br>\n").await;
             let _ = socket.write_all(b"3. Add files to SD card<br>\n").await;
             let _ = socket.write_all(b"4. Files will be listed here when SD reading is implemented<br>\n").await;
@@ -449,7 +449,7 @@ async fn main(spawner: Spawner) {
     info!("CYW43 initialized successfully");
 
     // SD card SPI will be initialized by the sd_card_task when needed
-    info!("SD card will use SPI0 pins: CLK=GP2, MOSI=GP3, MISO=GP0, CS=GP5");
+    info!("SD card will use SPI0 pins: SCK=GP18, MOSI=GP19, MISO=GP16, CS=GP17");
 
     // Configure network stack for AP mode with static IP
     info!("Configuring network stack...");

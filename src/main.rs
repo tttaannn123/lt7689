@@ -76,21 +76,15 @@ async fn net_task(mut runner: embassy_net::Runner<'static, cyw43::NetDriver<'sta
 }
 
 #[embassy_executor::task]
-async fn sd_card_task(
-    mut spi: Spi<'static, embassy_rp::peripherals::SPI0, Blocking>,
-    cs: Output<'static>,
-) {
+async fn sd_card_task() {
     info!("SD card task started, waiting for system to stabilize...");
     Timer::after(Duration::from_secs(3)).await;
 
     loop {
         info!("Attempting to read SD card...");
 
-        // Use ExclusiveDevice for CS management
-        let spi_device = ExclusiveDevice::new(spi, cs, embassy_time::Delay);
-
-        match read_sd_card(spi_device) {
-            Ok((new_spi, new_cs, file_list)) => {
+        match read_sd_card() {
+            Ok(file_list) => {
                 // Update shared state
                 {
                     let mut files = SD_FILES.lock().await;
@@ -106,34 +100,43 @@ async fn sd_card_task(
                 }
 
                 info!("SD card read successfully, found {} files", file_list.len());
-                spi = new_spi;
-                cs = new_cs;
             }
-            Err((new_spi, new_cs, e)) => {
+            Err(e) => {
                 {
                     let mut status = SD_STATUS.lock().await;
                     *status = e;
                 }
                 warn!("SD card error: {}", e);
-                spi = new_spi;
-                cs = new_cs;
             }
         }
 
-        // Scan every 15 seconds
-        Timer::after(Duration::from_secs(15)).await;
+        // Scan every 30 seconds
+        Timer::after(Duration::from_secs(30)).await;
     }
 }
 
-fn read_sd_card(
-    spi_device: ExclusiveDevice<Spi<'static, embassy_rp::peripherals::SPI0, Blocking>, Output<'static>, embassy_time::Delay>,
-) -> Result<
-    (Spi<'static, embassy_rp::peripherals::SPI0, Blocking>, Output<'static>, heapless::Vec<FileInfo, 32>),
-    (Spi<'static, embassy_rp::peripherals::SPI0, Blocking>, Output<'static>, &'static str),
-> {
+fn read_sd_card() -> Result<heapless::Vec<FileInfo, 32>, &'static str> {
     let mut file_list: heapless::Vec<FileInfo, 32> = heapless::Vec::new();
 
+    // Create SPI for SD card
+    let mut sd_spi_config = SpiConfig::default();
+    sd_spi_config.frequency = 400_000;
+
+    let spi = Spi::new_blocking(
+        unsafe { embassy_rp::peripherals::SPI0::steal() },
+        unsafe { embassy_rp::peripherals::PIN_2::steal() },
+        unsafe { embassy_rp::peripherals::PIN_3::steal() },
+        unsafe { embassy_rp::peripherals::PIN_0::steal() },
+        sd_spi_config,
+    );
+
+    let cs = Output::new(
+        unsafe { embassy_rp::peripherals::PIN_5::steal() },
+        Level::High,
+    );
+
     // Create SD card instance
+    let spi_device = ExclusiveDevice::new(spi, cs, embassy_time::Delay);
     let mut sd_card = SdCard::new(spi_device, embassy_time::Delay);
 
     // Initialize SD card
@@ -142,40 +145,31 @@ fn read_sd_card(
             info!("SD card detected: {} bytes", size);
         }
         Err(_) => {
-            let (spi, cs) = sd_card.free();
-            let (spi_inner, cs_inner, _delay) = spi.release();
-            return Err((spi_inner, cs_inner, "No SD card detected"));
+            return Err("No SD card detected");
         }
-    }
+    };
 
     // Create volume manager
     let mut volume_mgr: VolumeManager<_, _, 4, 4, 1> = VolumeManager::new(sd_card, DummyTimesource);
 
     // Open volume
-    let volume = match volume_mgr.open_volume(embedded_sdmmc::VolumeIdx(0)) {
+    let mut volume = match volume_mgr.open_volume(embedded_sdmmc::VolumeIdx(0)) {
         Ok(v) => v,
         Err(_) => {
-            let sd = volume_mgr.free();
-            let (spi, cs) = sd.free();
-            let (spi_inner, cs_inner, _delay) = spi.release();
-            return Err((spi_inner, cs_inner, "Failed to open volume (format as FAT32)"));
+            return Err("Failed to open volume (format as FAT32)");
         }
     };
 
     // Open root directory
-    let root_dir = match volume_mgr.open_root_dir(volume) {
+    let root_dir = match volume.open_root_dir() {
         Ok(dir) => dir,
         Err(_) => {
-            volume_mgr.close_volume(volume).ok();
-            let sd = volume_mgr.free();
-            let (spi, cs) = sd.free();
-            let (spi_inner, cs_inner, _delay) = spi.release();
-            return Err((spi_inner, cs_inner, "Failed to open root directory"));
+            return Err("Failed to open root directory");
         }
     };
 
     // Iterate through directory
-    let _ = volume_mgr.iterate_dir(root_dir, |entry| {
+    let _ = volume.iterate_dir(root_dir, |entry| {
         let mut name = heapless::String::new();
 
         // Convert filename to string - use core::fmt::Write explicitly
@@ -191,14 +185,9 @@ fn read_sd_card(
     });
 
     // Clean up
-    volume_mgr.close_dir(root_dir).ok();
-    volume_mgr.close_volume(volume).ok();
+    volume.close_dir(root_dir).ok();
 
-    let sd = volume_mgr.free();
-    let (spi, cs) = sd.free();
-    let (spi_inner, cs_inner, _delay) = spi.release();
-
-    Ok((spi_inner, cs_inner, file_list))
+    Ok(file_list)
 }
 
 fn format_size(bytes: u32) -> heapless::String<16> {
@@ -456,21 +445,8 @@ async fn main(spawner: Spawner) {
 
     info!("CYW43 initialized successfully");
 
-    // Initialize SD Card SPI (blocking mode for embedded-sdmmc)
-    info!("Initializing SD card SPI interface...");
-    let mut sd_spi_config = SpiConfig::default();
-    sd_spi_config.frequency = 400_000; // Start at 400kHz for SD card initialization
-
-    let sd_spi = Spi::new_blocking(
-        p.SPI0,
-        p.PIN_2,  // CLK
-        p.PIN_3,  // MOSI
-        p.PIN_0,  // MISO
-        sd_spi_config,
-    );
-
-    let sd_cs = Output::new(p.PIN_5, Level::High);
-    info!("SD card SPI initialized in blocking mode");
+    // SD card SPI will be initialized by the sd_card_task when needed
+    info!("SD card will use SPI0 pins: CLK=GP2, MOSI=GP3, MISO=GP0, CS=GP5");
 
     // Configure network stack for AP mode with static IP
     info!("Configuring network stack...");
@@ -509,7 +485,7 @@ async fn main(spawner: Spawner) {
 
     // Spawn SD card scanning task
     info!("Starting SD card scanner task...");
-    spawner.spawn(sd_card_task(sd_spi, sd_cs).unwrap());
+    spawner.spawn(sd_card_task().unwrap());
     info!("SD card scanner task spawned");
 
     // Spawn HTTP server
